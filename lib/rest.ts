@@ -1,141 +1,224 @@
-import { Store, fail, required, stateList, type Repository, type Input } from './store.ts';
+import {
+  fail, required, stateList, Store,
+  type Input, type Repository,
+} from './store.ts';
 
-export function rest(store: Store, method: string, parts: string[], url: URL, body: Input): [number, unknown?, Record<string, string>?] {
-  const [group, owner, name, resource, number, action] = parts;
-  const query = url.searchParams;
-  if (!group && method === 'GET') {
-    return [200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' }];
+type RestResponse = [number, unknown?, Record<string, string>?];
+
+export function rest(
+  store: Store, method: string, parts: string[], url: URL, body: Input,
+): RestResponse {
+  const [segment, account, project, endpoint, identifier, operation] = parts;
+  const params = url.searchParams;
+  if (method === 'GET' && !segment) {
+    return [200, {
+      current_user_url: '/api/v3/user',
+      rate_limit_url: '/api/v3/rate_limit',
+    }, { 'x-oauth-scopes': 'repo, read:org' }];
   }
-  if (group === 'meta' && parts.length === 1 && method === 'GET') return [200, { installed_version: '1.0.0' }];
-  if (group === 'user' && parts.length === 1 && method === 'GET' && store.owner) return [200, { login: store.login }];
-  if (group === 'user' && owner === 'repos' && parts.length === 2) {
-    if (method === 'POST') return [201, store.view(store.createRepo(body))];
+  if (segment === 'meta' && parts.length === 1 && method === 'GET') {
+    return [200, { installed_version: '1.0.0' }];
+  }
+  if (segment === 'user' && parts.length === 1 && method === 'GET' && store.owner) {
+    return [200, { login: store.login }];
+  }
+  if (segment === 'user' && account === 'repos' && parts.length === 2) {
+    if (method === 'POST') {
+      return [201, store.view(store.createRepo(body))];
+    }
     if (method === 'GET') {
-      const limit = Math.max(1, Math.min(100, Number(query.get('per_page')) || 30));
-      const page = Math.max(1, Number(query.get('page')) || 1);
-      const repos = [...store.repos.values()];
-      const next = new URL(url);
-      next.searchParams.set('page', String(page + 1));
-      return [200, repos.slice((page - 1) * limit, page * limit).map(repo => store.view(repo)),
-        page * limit < repos.length ? { link: '<' + next + '>; rel="next"' } : undefined];
+      const pageSize = Math.max(1, Math.min(100, Number(params.get('per_page')) || 30));
+      const pageIndex = Math.max(1, Number(params.get('page')) || 1);
+      const allRepos = Array.from(store.repos.values());
+      const followingPage = new URL(url);
+      followingPage.searchParams.set('page', String(pageIndex + 1));
+      const selectedRepos = allRepos.slice((pageIndex - 1) * pageSize, pageIndex * pageSize);
+      const responseHeaders = pageIndex * pageSize < allRepos.length
+        ? { link: `<${followingPage}>; rel="next"` }
+        : undefined;
+      return [200, selectedRepos.map(projectRepo => store.view(projectRepo)), responseHeaders];
     }
   }
-  if (group !== 'repos' || !owner || !name) fail();
-  const repo = store.repo(owner, name);
-  if (!resource) {
-    if (method === 'GET') return [200, store.view(repo)];
-    if (method === 'PATCH') {
-      if (typeof body.description === 'string') repo.description = body.description;
-      return [200, store.view(repo)];
-    }
-    if (method === 'DELETE') {
-      store.repos.delete(name.toLowerCase());
-      return [204];
-    }
+  if (segment !== 'repos' || !account || !project) {
+    fail();
   }
-  if (resource === 'git' && number === 'refs') {
-    if (method === 'POST' && !action) {
-      const ref = required(body.ref, 'ref');
-      const sha = required(body.sha, 'sha');
-      if (!/^refs\/(heads|tags)\/.+/.test(ref) || !repo.objects.has(sha) || repo.refs.has(ref)) fail(422, 'Invalid ref');
-      repo.refs.set(ref, sha);
-      return [201, { ref, object: { sha } }];
-    }
-    if (method === 'GET' && action) {
-      const ref = 'refs/' + parts.slice(5).join('/');
-      const sha = repo.refs.get(ref) ?? fail();
-      return [200, { ref, object: { sha } }];
+  const repository = store.repo(account, project);
+  if (!endpoint) {
+    switch (method) {
+      case 'GET':
+        return [200, store.view(repository)];
+      case 'PATCH':
+        if (typeof body.description === 'string') {
+          repository.description = body.description;
+        }
+        return [200, store.view(repository)];
+      case 'DELETE':
+        store.repos.delete(project.toLowerCase());
+        return [204];
     }
   }
-  if (method === 'GET' && resource === 'branches') {
-    const view = (name: string, sha: string) => ({ name, commit: { sha } });
-    if (number) return [200, view(number, repo.refs.get('refs/heads/' + parts.slice(4).join('/')) ?? fail())];
-    return [200, [...repo.refs].filter(([ref]) => ref.startsWith('refs/heads/')).map(([ref, sha]) => view(ref.slice(11), sha))];
+  if (endpoint === 'git' && identifier === 'refs') {
+    if (method === 'POST' && !operation) {
+      const reference = required(body.ref, 'ref');
+      const objectId = required(body.sha, 'sha');
+      if (!/^refs\/(heads|tags)\/.+/.test(reference)
+        || !repository.objects.has(objectId) || repository.refs.has(reference)) {
+        fail(422, 'Invalid ref');
+      }
+      repository.refs.set(reference, objectId);
+      return [201, { ref: reference, object: { sha: objectId } }];
+    }
+    if (method === 'GET' && operation) {
+      const reference = `refs/${parts.slice(5).join('/')}`;
+      const objectId = repository.refs.get(reference) ?? fail();
+      return [200, { ref: reference, object: { sha: objectId } }];
+    }
   }
-  if (method === 'GET' && resource === 'commits' && !number) {
-    return [200, [...repo.ancestors(repo.resolve(query.get('sha') ?? repo.branch))]
-      .map(sha => ({ sha, commit: { message: repo.readCommit(sha)!.message } }))];
+  if (endpoint === 'branches' && method === 'GET') {
+    const branchView = (branchName: string, objectId: string) => ({
+      name: branchName, commit: { sha: objectId },
+    });
+    if (identifier) {
+      const branchRef = `refs/heads/${parts.slice(4).join('/')}`;
+      return [200, branchView(identifier, repository.refs.get(branchRef) ?? fail())];
+    }
+    const branchRefs = Array.from(repository.refs).filter(([reference]) => reference.startsWith('refs/heads/'));
+    return [200, branchRefs.map(([reference, objectId]) => branchView(reference.slice(11), objectId))];
   }
-  if (resource === 'contents') return contents(repo, method, parts.slice(4).join('/'), query, body);
-  if (resource === 'labels' && !number && method === 'POST') {
-    const label = { name: required(body.name, 'name'), color: body.color ?? '', description: body.description ?? '' };
-    repo.labels.set(label.name, label);
-    return [201, label];
+  if (endpoint === 'commits' && method === 'GET' && !identifier) {
+    const startingCommit = repository.resolve(params.get('sha') ?? repository.branch);
+    const history = Array.from(repository.ancestors(startingCommit));
+    return [200, history.map(objectId => ({
+      sha: objectId, commit: { message: repository.readCommit(objectId)!.message },
+    }))];
   }
-  if (resource === 'issues') {
-    if (!number) {
-      if (method === 'POST') return [201, store.createIssue(repo, body)];
-      if (method === 'GET') {
-        const list = stateList(repo.issues.values(), query.get('state') ?? 'open');
-        return [200, query.get('direction') === 'asc' ? list : list.reverse()];
+  if (endpoint === 'contents') {
+    return handleContents(repository, method, parts.slice(4).join('/'), params, body);
+  }
+  if (endpoint === 'labels' && !identifier && method === 'POST') {
+    const createdLabel = {
+      name: required(body.name, 'name'),
+      color: body.color ?? '',
+      description: body.description ?? '',
+    };
+    repository.labels.set(createdLabel.name, createdLabel);
+    return [201, createdLabel];
+  }
+  if (endpoint === 'issues') {
+    if (!identifier) {
+      switch (method) {
+        case 'POST':
+          return [201, store.createIssue(repository, body)];
+        case 'GET': {
+          const matchingIssues = stateList(repository.issues.values(), params.get('state') ?? 'open');
+          if (params.get('direction') !== 'asc') matchingIssues.reverse();
+          return [200, matchingIssues];
+        }
       }
     } else {
-      const issue = repo.issues.get(Number(number)) ?? fail();
-      if (!action && method === 'GET') return [200, issue];
-      if (!action && method === 'PATCH') {
-        if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
-        if (typeof body.title === 'string') issue.title = body.title;
-        if (typeof body.body === 'string') issue.body = body.body;
-        return [200, issue];
+      const selectedIssue = repository.issues.get(Number(identifier)) ?? fail();
+      if (!operation) {
+        if (method === 'GET') return [200, selectedIssue];
+        if (method === 'PATCH') {
+          if (body.state === 'open' || body.state === 'closed') selectedIssue.state = body.state;
+          if (typeof body.title === 'string') selectedIssue.title = body.title;
+          if (typeof body.body === 'string') selectedIssue.body = body.body;
+          return [200, selectedIssue];
+        }
       }
-      if (action === 'comments' && parts.length === 6) {
-        if (method === 'GET') return [200, repo.comments.get(issue.number) ?? []];
-        if (method === 'POST') return [201, store.comment(repo, issue, body)];
+      if (operation === 'comments' && parts.length === 6) {
+        if (method === 'GET') return [200, repository.comments.get(selectedIssue.number) ?? []];
+        if (method === 'POST') return [201, store.comment(repository, selectedIssue, body)];
       }
     }
   }
-  if (resource === 'pulls') {
-    if (!number) {
-      if (method === 'POST') return [201, store.createPull(repo, body)];
-      if (method === 'GET') return [200, stateList(repo.pulls.values(), query.get('state') ?? 'open').reverse()];
+  if (endpoint === 'pulls') {
+    if (!identifier) {
+      switch (method) {
+        case 'POST':
+          return [201, store.createPull(repository, body)];
+        case 'GET':
+          return [200, stateList(repository.pulls.values(), params.get('state') ?? 'open').reverse()];
+      }
     } else {
-      const pull = repo.pulls.get(Number(number)) ?? fail();
-      if (!action && method === 'GET') return [200, pull];
-      if (action === 'files' && method === 'GET' && parts.length === 6) return [200, store.pullFiles(repo, pull)];
-      if (action === 'merge' && method === 'PUT' && parts.length === 6) return [200, store.merge(repo, pull, body)];
+      const selectedPull = repository.pulls.get(Number(identifier)) ?? fail();
+      if (!operation && method === 'GET') return [200, selectedPull];
+      if (operation === 'files' && method === 'GET' && parts.length === 6) {
+        return [200, store.pullFiles(repository, selectedPull)];
+      }
+      if (operation === 'merge' && method === 'PUT' && parts.length === 6) {
+        return [200, store.merge(repository, selectedPull, body)];
+      }
     }
   }
-  fail();
+  return fail();
 }
 
-function contents(repo: Repository, method: string, path: string, query: URLSearchParams, body: Input): [number, unknown] {
+function handleContents(
+  repository: Repository, method: string, pathname: string, params: URLSearchParams, body: Input,
+): [number, unknown] {
   if (method === 'GET') {
-    const tip = repo.resolve(query.get('ref') ?? repo.branch);
-    const tree = repo.readCommit(tip)?.tree ?? fail();
-    let sha = tree;
-    for (const name of path.split('/').filter(Boolean)) {
-      if (repo.objects.get(sha)?.type !== 2) fail();
-      sha = repo.entries(sha).find(entry => entry.name === name)?.sha ?? fail();
+    const resolvedCommit = repository.resolve(params.get('ref') ?? repository.branch);
+    let objectId = repository.readCommit(resolvedCommit)?.tree ?? fail();
+    const components = pathname.split('/').filter(Boolean);
+    for (let index = 0; index < components.length; index += 1) {
+      if (repository.objects.get(objectId)?.type !== 2) fail();
+      const child = repository.entries(objectId).find(candidate => candidate.name === components[index]);
+      objectId = child?.sha ?? fail();
     }
-    const object = repo.objects.get(sha) ?? fail();
-    if (object.type === 2) return [200, repo.entries(sha).map(entry => ({
-      name: entry.name, path: path ? path + '/' + entry.name : entry.name, sha: entry.sha,
-      type: entry.mode === '40000' ? 'dir' : 'file',
-      size: repo.objects.get(entry.sha)?.data.length ?? 0,
-    }))];
-    return [200, { type: 'file', name: path.split('/').at(-1), path, sha, size: object.data.length,
-      encoding: 'base64', content: object.data.toString('base64') }];
+    const storedObject = repository.objects.get(objectId) ?? fail();
+    if (storedObject.type === 2) {
+      const children = repository.entries(objectId).map(child => ({
+        name: child.name,
+        path: pathname ? `${pathname}/${child.name}` : child.name,
+        sha: child.sha,
+        type: child.mode === '40000' ? 'dir' : 'file',
+        size: repository.objects.get(child.sha)?.data.length ?? 0,
+      }));
+      return [200, children];
+    }
+    return [200, {
+      type: 'file', name: pathname.split('/').at(-1), path: pathname,
+      sha: objectId, size: storedObject.data.length,
+      encoding: 'base64', content: storedObject.data.toString('base64'),
+    }];
   }
-  if (method !== 'PUT' && method !== 'DELETE') fail();
-  if (!path || path.split('/').some(name => !name || name === '.' || name === '..' || name.includes('\0'))) fail(422, 'Invalid path');
-  const branch = body.branch ?? repo.branch;
-  const ref = 'refs/heads/' + branch;
-  const tip = repo.refs.get(ref);
-  if (!tip && branch !== repo.branch) fail(422, 'Unknown branch');
-  const files = repo.files(tip);
-  const current = files.get(path);
-  if (method === 'DELETE' && !current) fail();
-  if (body.sha !== current?.sha) fail(409, 'SHA does not match');
-  const message = required(body.message, 'message');
+  if (method !== 'PUT' && method !== 'DELETE') return fail();
+  const invalidPath = !pathname || pathname.split('/').some(component => (
+    !component || component === '.' || component === '..' || component.includes('\0')
+  ));
+  if (invalidPath) {
+    fail(422, 'Invalid path');
+  }
+  const targetBranch = body.branch ?? repository.branch;
+  const branchReference = `refs/heads/${targetBranch}`;
+  const branchTip = repository.refs.get(branchReference);
+  if (!branchTip && targetBranch !== repository.branch) {
+    fail(422, 'Unknown branch');
+  }
+  const updatedFiles = repository.files(branchTip);
+  const previousEntry = updatedFiles.get(pathname);
+  if (method === 'DELETE' && !previousEntry) return fail();
+  if (body.sha !== previousEntry?.sha) {
+    fail(409, 'SHA does not match');
+  }
+  const commitMessage = required(body.message, 'message');
   if (method === 'DELETE') {
-    files.delete(path);
-    return [200, { commit: { sha: repo.commit(branch, files, message) } }];
+    updatedFiles.delete(pathname);
+    return [200, { commit: { sha: repository.commit(targetBranch, updatedFiles, commitMessage) } }];
   }
-  if (typeof body.content !== 'string') fail(422, 'Missing content');
-  for (const existing of files.keys()) {
-    if (existing.startsWith(path + '/') || path.startsWith(existing + '/')) fail(409, 'Path conflicts with existing content');
+  if (typeof body.content !== 'string') {
+    fail(422, 'Missing content');
   }
-  const sha = repo.put(3, Buffer.from(body.content, 'base64'));
-  files.set(path, { sha, mode: current?.mode ?? '100644' });
-  return [current ? 200 : 201, { content: { sha, encoding: 'base64' }, commit: { sha: repo.commit(branch, files, message) } }];
+  for (const occupiedPath of updatedFiles.keys()) {
+    if (occupiedPath.startsWith(`${pathname}/`) || pathname.startsWith(`${occupiedPath}/`)) {
+      fail(409, 'Path conflicts with existing content');
+    }
+  }
+  const blobId = repository.put(3, Buffer.from(body.content, 'base64'));
+  updatedFiles.set(pathname, { sha: blobId, mode: previousEntry?.mode ?? '100644' });
+  return [previousEntry ? 200 : 201, {
+    content: { sha: blobId, encoding: 'base64' },
+    commit: { sha: repository.commit(targetBranch, updatedFiles, commitMessage) },
+  }];
 }
