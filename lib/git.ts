@@ -4,46 +4,56 @@ import { readPack, writePack } from './pack.ts';
 const flush = Buffer.from('0000');
 const delimiter = Buffer.from('0001');
 const receiveCapabilities = 'report-status side-band-64k delete-refs ofs-delta object-format=sha1';
-function packet(data: string | Buffer) {
-  const length = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
-  const header = (length + 4).toString(16).padStart(4, '0');
-  const result = Buffer.allocUnsafe(header.length + length);
-  result.write(header, 'ascii');
-  if (typeof data === 'string') result.write(data, header.length);
-  else data.copy(result, header.length);
-  return result;
+
+function packet(payload: string | Buffer) {
+  const bytes = typeof payload === 'string' ? Buffer.byteLength(payload) : payload.length;
+  const prefix = (bytes + 4).toString(16).padStart(4, '0');
+  const framed = Buffer.allocUnsafe(prefix.length + bytes);
+  framed.write(prefix, 'ascii');
+  if (typeof payload === 'string') framed.write(payload, prefix.length);
+  else payload.copy(framed, prefix.length);
+  return framed;
 }
-function sideband(data: Buffer) {
-  const chunks: Buffer[] = [];
-  for (let i = 0; i < data.length; i += 65515) {
-    chunks.push(packet(Buffer.concat([Buffer.from([1]), data.subarray(i, i + 65515)])));
+
+function sideband(payload: Buffer) {
+  const frames: Buffer[] = [];
+  for (let start = 0; start < payload.length; start += 65515) {
+    const part = payload.subarray(start, start + 65515);
+    frames.push(packet(Buffer.concat([Buffer.from([1]), part])));
   }
-  chunks.push(flush);
-  return chunks;
+  frames.push(flush);
+  return frames;
 }
+
 function readLines(data: Buffer, stopAtFlush: boolean) {
-  let offset = 0;
   const lines: string[] = [];
+  let offset = 0;
   while (offset < data.length) {
-    const header = data.toString('ascii', offset, offset + 4);
-    if (!/^[\da-f]{4}$/.test(header)) throw new Error('Invalid packet');
-    const size = parseInt(header, 16);
-    if (size <= 2) {
+    const prefix = data.toString('ascii', offset, offset + 4);
+    if (!/^[\da-f]{4}$/.test(prefix)) throw new Error('Invalid packet');
+    const length = parseInt(prefix, 16);
+    if (length <= 2) {
       offset += 4;
-      if (!size && stopAtFlush) break;
-    } else {
-      if (size < 4 || offset + size > data.length) throw new Error('Truncated packet');
-      lines.push(data.toString('utf8', offset + 4, offset + size).replace(/\n$/, ''));
-      offset += size;
+      if (length === 0 && stopAtFlush) break;
+      continue;
     }
+    if (length < 4 || offset + length > data.length) throw new Error('Truncated packet');
+    lines.push(data.toString('utf8', offset + 4, offset + length).replace(/\n$/, ''));
+    offset += length;
   }
   return { lines, offset };
 }
-const sortedRefs = (repo: Objects) => [...repo.refs.keys()].sort();
+
+function sortedRefs(repo: Objects) {
+  return [...repo.refs.keys()].sort();
+}
+
 const uploadAdvertisement = Buffer.concat([
   ...['version 2', 'agent=makefun-forge', 'ls-refs=unborn', 'fetch=shallow', 'object-format=sha1']
-    .map(line => packet(line + '\n')), flush,
+    .map(feature => packet(feature + '\n')),
+  flush,
 ]);
+
 export function advertise(repo: Objects, service: string, v2: boolean) {
   if (v2) return uploadAdvertisement;
   const upload = service === 'git-upload-pack';
@@ -52,8 +62,9 @@ export function advertise(repo: Objects, service: string, v2: boolean) {
   if (upload && repo.refs.has(repo.head)) refs.unshift(['HEAD', repo.refs.get(repo.head)!]);
   if (!upload && !refs.length) refs.push(['capabilities^{}', zero]);
   const packets = [packet('# service=' + service + '\n'), flush];
-  for (const [i, [name, sha]] of refs.entries()) {
-    packets.push(packet(sha + ' ' + name + (i ? '' : '\0' + capabilities) + '\n'));
+  for (const [index, [name, sha]] of refs.entries()) {
+    const suffix = index === 0 ? '\0' + capabilities : '';
+    packets.push(packet(sha + ' ' + name + suffix + '\n'));
     const peeled = upload ? repo.peel(sha) : sha;
     if (peeled !== sha) packets.push(packet(peeled + ' ' + name + '^{}\n'));
   }
@@ -66,14 +77,14 @@ function lsRefs(repo: Objects, lines: string[]) {
   for (const name of ['HEAD', ...sortedRefs(repo)]) {
     if (prefixes.length && !prefixes.some(prefix => name.startsWith(prefix))) continue;
     const sha = repo.refs.get(name === 'HEAD' ? repo.head : name);
-    const attributes: string[] = [];
-    if (name === 'HEAD' && (lines.includes('symrefs') || !sha)) attributes.push('symref-target:' + repo.head);
+    const fields: string[] = [];
+    if (name === 'HEAD' && (lines.includes('symrefs') || !sha)) fields.push('symref-target:' + repo.head);
     if (!sha && !lines.includes('unborn')) continue;
     if (sha && lines.includes('peel')) {
       const peeled = repo.peel(sha);
-      if (peeled !== sha) attributes.push('peeled:' + peeled);
+      if (peeled !== sha) fields.push('peeled:' + peeled);
     }
-    packets.push(packet([sha ?? 'unborn', name, ...attributes].join(' ') + '\n'));
+    packets.push(packet([sha ?? 'unborn', name, ...fields].join(' ') + '\n'));
   }
   return Buffer.concat([...packets, flush]);
 }
@@ -81,45 +92,47 @@ function lsRefs(repo: Objects, lines: string[]) {
 function history(repo: Objects, tips: string[], depth: number, stops: Set<string>) {
   const seen = new Set<string>();
   const boundary = new Set<string>();
-  const queue = tips.map(sha => ({ sha, level: 1 }));
-  for (let i = 0; i < queue.length; i++) {
-    const { sha, level } = queue[i];
+  const pending = tips.map(sha => ({ sha, level: 1 }));
+  for (let cursor = 0; cursor < pending.length; cursor++) {
+    const { sha, level } = pending[cursor];
     if (seen.has(sha)) continue;
     const object = repo.objects.get(sha);
     if (!object) continue;
     seen.add(sha);
-    if (object.type === 4) queue.push({ sha: repo.peel(sha), level });
+    if (object.type === 4) pending.push({ sha: repo.peel(sha), level });
     const commit = repo.readCommit(sha);
     if (!commit || stops.has(sha)) continue;
     if (level >= depth) {
       if (commit.parents.length) boundary.add(sha);
     } else {
-      for (const parent of commit.parents) queue.push({ sha: parent, level: level + 1 });
+      for (const parent of commit.parents) pending.push({ sha: parent, level: level + 1 });
     }
   }
   return { seen, boundary };
 }
 
 function reachable(repo: Objects, commits: Set<string>, excluded = new Set<string>()) {
-  const ids = new Set<string>();
-  const queue = [...commits];
-  while (queue.length) {
-    const sha = queue.pop()!;
-    if (ids.has(sha) || excluded.has(sha)) continue;
+  const collected = new Set<string>();
+  const pending = [...commits];
+  while (pending.length) {
+    const sha = pending.pop()!;
+    if (collected.has(sha) || excluded.has(sha)) continue;
     const object = repo.objects.get(sha);
     if (!object) continue;
-    ids.add(sha);
+    collected.add(sha);
     const commit = repo.readCommit(sha);
-    if (commit) queue.push(commit.tree);
+    if (commit) pending.push(commit.tree);
     if (object.type === 2) {
-      for (const entry of repo.entries(sha)) if (entry.mode !== '160000') queue.push(entry.sha);
+      for (const entry of repo.entries(sha)) {
+        if (entry.mode !== '160000') pending.push(entry.sha);
+      }
     }
   }
-  return ids;
+  return collected;
 }
 
-// Fetches address objects by ID. Objects are append-only, and adding an object can
-// complete a previously missing edge. Ref changes only affect ls-refs and advertisements.
+// An added object may supply an edge that was absent during an earlier fetch.
+// Refs do not change ID-based fetch results; advertisements read them directly.
 const lastFetch = new WeakMap<Objects, {
   objectCount: number; request: Buffer; response: Buffer; v2: boolean;
 }>();
@@ -132,7 +145,8 @@ export function upload(repo: Objects, data: Buffer, v2: boolean) {
   const { lines } = readLines(data, false);
   if (lines.includes('command=ls-refs')) return lsRefs(repo, lines);
   if (v2 && !lines.includes('command=fetch')) throw new Error('Unknown upload command');
-  const args = (prefix: string) => lines.filter(line => line.startsWith(prefix)).map(line => line.slice(prefix.length).split(' ')[0]);
+  const args = (prefix: string) => lines.filter(line => line.startsWith(prefix))
+    .map(line => line.slice(prefix.length).split(' ')[0]);
   const wants = args('want ');
   if (wants.some(sha => !repo.objects.has(sha))) return packet('ERR not our ref\n');
   const haves = args('have ').filter(sha => repo.objects.has(sha));
@@ -141,8 +155,10 @@ export function upload(repo: Objects, data: Buffer, v2: boolean) {
   const known = reachable(repo, history(repo, haves, Infinity, shallow).seen);
   const wanted = history(repo, wants, depth, Number.isFinite(depth) ? new Set() : shallow);
   const boundaries = [...wanted.boundary].filter(sha => !shallow.has(sha)).map(sha => packet('shallow ' + sha + '\n'));
-  if (Number.isFinite(depth)) for (const sha of shallow) {
-    if (wanted.seen.has(sha) && !wanted.boundary.has(sha)) boundaries.push(packet('unshallow ' + sha + '\n'));
+  if (Number.isFinite(depth)) {
+    for (const sha of shallow) {
+      if (wanted.seen.has(sha) && !wanted.boundary.has(sha)) boundaries.push(packet('unshallow ' + sha + '\n'));
+    }
   }
   const response: Buffer[] = [];
   if (v2 && !lines.includes('done')) {
@@ -162,7 +178,8 @@ export function upload(repo: Objects, data: Buffer, v2: boolean) {
     response.push(packet(haves.length ? 'ACK ' + haves[0] + '\n' : 'NAK\n'));
   }
   const pack = writePack(repo, reachable(repo, wanted.seen, known));
-  const result = Buffer.concat([...response, ...(v2 || /side-band-64k/.test(lines[0] ?? '') ? sideband(pack) : [pack])]);
+  const packFrames = v2 || /side-band-64k/.test(lines[0] ?? '') ? sideband(pack) : [pack];
+  const result = Buffer.concat([...response, ...packFrames]);
   if (data.length <= 64 * 1024 && result.length <= 1024 * 1024) {
     lastFetch.set(repo, { objectCount: repo.objects.size, request: Buffer.from(data), response: result, v2 });
   }
@@ -172,18 +189,18 @@ export function upload(repo: Objects, data: Buffer, v2: boolean) {
 export function receive(repo: Objects, data: Buffer) {
   const { lines, offset } = readLines(data, true);
   const capabilities = (lines[0]?.split('\0')[1] ?? '').split(' ');
-  const updates = lines.map(line => line.split('\0')[0].split(' '));
-  let error = '';
+  const commands = lines.map(line => line.split('\0')[0].split(' '));
+  let unpackError = '';
   try {
     if (offset < data.length) readPack(repo, data.subarray(offset));
   } catch {
-    error = 'invalid pack';
+    unpackError = 'invalid pack';
   }
-  const report = [packet('unpack ' + (error || 'ok') + '\n')];
-  for (const [old, next, ref] of updates) {
-    let reason = error;
-    const valid = /^[0-9a-f]{40}$/;
-    if (!reason && (!valid.test(old) || !valid.test(next) || !/^refs\/(heads|tags)\/[^\s\x00-\x1f~^:?*\[\\]+$/.test(ref ?? '') ||
+  const report = [packet('unpack ' + (unpackError || 'ok') + '\n')];
+  for (const [old, next, ref] of commands) {
+    let reason = unpackError;
+    const objectIdPattern = /^[0-9a-f]{40}$/;
+    if (!reason && (!objectIdPattern.test(old) || !objectIdPattern.test(next) || !/^refs\/(heads|tags)\/[^\s\x00-\x1f~^:?*\[\\]+$/.test(ref ?? '') ||
         ref.includes('..') || ref.includes('@{') || ref.split('/').some(part => !part || part.startsWith('.') || part.endsWith('.lock')))) {
       reason = 'invalid ref';
     }
