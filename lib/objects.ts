@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 
 export const types = ['', 'commit', 'tree', 'blob', 'tag'] as const;
 export const zero = '0'.repeat(40);
-export const digest = (bytes: Buffer) => createHash('sha1').update(bytes).digest();
+export const digest = (bytes: Buffer) => hash('sha1', bytes, 'buffer');
 export interface GitObject {
   type: number;
   data: Buffer;
@@ -155,8 +155,16 @@ function looseHeader(type: number, size: number) {
   return types[type] + ' ' + size + '\0';
 }
 export function makeObject(type: number, data: Buffer, compressed?: Buffer): GitObject {
-  const loose = deflateSync(Buffer.concat([Buffer.from(looseHeader(type, data.length)), data]), { level: 1 });
-  return { type, data, loose, compressed };
+  return {
+    type, data,
+    get loose() {
+      // Smart HTTP uses pack entries, so most objects never need loose encoding.
+      const loose = deflateSync(Buffer.concat([Buffer.from(looseHeader(type, data.length)), data]), { level: 1 });
+      Object.defineProperty(this, 'loose', { value: loose, writable: true });
+      return loose;
+    },
+    compressed,
+  };
 }
 export function compressedObject(object: GitObject) {
   return object.compressed ??= deflateSync(object.data, { level: 1 });

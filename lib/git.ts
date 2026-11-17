@@ -5,8 +5,13 @@ const flush = Buffer.from('0000');
 const delimiter = Buffer.from('0001');
 const receiveCapabilities = 'report-status side-band-64k delete-refs ofs-delta object-format=sha1';
 function packet(data: string | Buffer) {
-  const body = typeof data === 'string' ? Buffer.from(data) : data;
-  return Buffer.concat([Buffer.from((body.length + 4).toString(16).padStart(4, '0')), body]);
+  const length = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+  const header = (length + 4).toString(16).padStart(4, '0');
+  const result = Buffer.allocUnsafe(header.length + length);
+  result.write(header, 'ascii');
+  if (typeof data === 'string') result.write(data, header.length);
+  else data.copy(result, header.length);
+  return result;
 }
 function sideband(data: Buffer) {
   const chunks: Buffer[] = [];
@@ -35,11 +40,12 @@ function readLines(data: Buffer, stopAtFlush: boolean) {
   return { lines, offset };
 }
 const sortedRefs = (repo: Objects) => [...repo.refs.keys()].sort();
+const uploadAdvertisement = Buffer.concat([
+  ...['version 2', 'agent=makefun-forge', 'ls-refs=unborn', 'fetch=shallow', 'object-format=sha1']
+    .map(line => packet(line + '\n')), flush,
+]);
 export function advertise(repo: Objects, service: string, v2: boolean) {
-  if (v2) return Buffer.concat([
-    ...['version 2', 'agent=makefun-forge', 'ls-refs=unborn', 'fetch=shallow', 'object-format=sha1']
-      .map(line => packet(line + '\n')), flush,
-  ]);
+  if (v2) return uploadAdvertisement;
   const upload = service === 'git-upload-pack';
   const capabilities = upload ? 'side-band-64k shallow ofs-delta symref=HEAD:' + repo.head : receiveCapabilities;
   const refs = sortedRefs(repo).map(name => [name, repo.refs.get(name)!]);
@@ -112,7 +118,17 @@ function reachable(repo: Objects, commits: Set<string>, excluded = new Set<strin
   return ids;
 }
 
+// Fetches address objects by ID. Objects are append-only, and adding an object can
+// complete a previously missing edge. Ref changes only affect ls-refs and advertisements.
+const lastFetch = new WeakMap<Objects, {
+  objectCount: number; request: Buffer; response: Buffer; v2: boolean;
+}>();
+
 export function upload(repo: Objects, data: Buffer, v2: boolean) {
+  const cached = lastFetch.get(repo);
+  if (cached?.objectCount === repo.objects.size && cached.v2 === v2 && cached.request.equals(data)) {
+    return cached.response;
+  }
   const { lines } = readLines(data, false);
   if (lines.includes('command=ls-refs')) return lsRefs(repo, lines);
   if (v2 && !lines.includes('command=fetch')) throw new Error('Unknown upload command');
@@ -146,7 +162,11 @@ export function upload(repo: Objects, data: Buffer, v2: boolean) {
     response.push(packet(haves.length ? 'ACK ' + haves[0] + '\n' : 'NAK\n'));
   }
   const pack = writePack(repo, reachable(repo, wanted.seen, known));
-  return Buffer.concat([...response, ...(v2 || /side-band-64k/.test(lines[0] ?? '') ? sideband(pack) : [pack])]);
+  const result = Buffer.concat([...response, ...(v2 || /side-band-64k/.test(lines[0] ?? '') ? sideband(pack) : [pack])]);
+  if (data.length <= 64 * 1024 && result.length <= 1024 * 1024) {
+    lastFetch.set(repo, { objectCount: repo.objects.size, request: Buffer.from(data), response: result, v2 });
+  }
+  return result;
 }
 
 export function receive(repo: Objects, data: Buffer) {

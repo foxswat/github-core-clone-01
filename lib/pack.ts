@@ -113,6 +113,7 @@ export function readPack(repo: Objects, pack: Buffer) {
     const packedAt = offset;
     const { buffer: data, engine } = inflateSync(pack.subarray(offset, end), {
       info: true, maxOutputLength: Math.max(1, size),
+      chunkSize: Math.max(64, Math.min(16 * 1024, size + 1)),
     }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     offset += engine.bytesWritten;
     if (data.length !== size) throw new Error('Wrong object size');
